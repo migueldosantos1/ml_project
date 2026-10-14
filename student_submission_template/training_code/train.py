@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import sklearn.metrics as metrics
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, Ridge
 
 DATA_PATH = "data/chlorophyll_student_2015_2023.xlsx"
 TARGET = "chlorophyll_a_mg_m3"
@@ -87,6 +87,20 @@ def show_peaks(y_train, dates_train, threshold=4):
     # y_train > threshold e uma mascara booleana: so mostra as linhas True
     print(tabela[y_train > threshold])
 
+def normalizar(X_train, X_val):
+    mu = X_train.mean()
+    sd = X_train.std()
+    sd = sd.replace(0, 1) #Se sd = 0 divisão daria NaN
+    X_train_norm = (X_train - mu) / sd
+    X_val_norm = (X_val - mu) / sd
+    return X_train_norm, X_val_norm, mu, sd
+
+def teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val):
+    for alpha in alphas:
+        model = Ridge(alpha=alpha)
+        model.fit(X_train_norm, y_train_clip)                                    
+        m_train = metrics_calc(y_train_orig, model.predict(X_train_norm), f"Treino (alpha={alpha})")   
+        m_val = metrics_calc(y_val, model.predict(X_val_norm), f"Validacao (alpha={alpha})")
 
 def main():
     df = load_data(DATA_PATH)
@@ -117,7 +131,7 @@ def main():
     # ~train_mask inverte a mascara: True passa a False, ou seja, fica a validacao
     train_mask = dates < SPLIT_DATE
     X_train, X_val = X[train_mask], X[~train_mask]
-    y_train_c = y_clip[train_mask]
+    y_train_clip = y_clip[train_mask]
     y_train_orig = y_orig[train_mask]
     y_val = y_orig[~train_mask]
     print(X_train.shape, X_val.shape)
@@ -133,11 +147,18 @@ def main():
 
     # fit estima os pesos (theta) e o intercepto minimizando a soma dos erros ao quadrado.
     # Nao se adiciona coluna de uns: o LinearRegression ja estima o intercepto
-    model = LinearRegression().fit(X_train, y_train_c)
+    model = LinearRegression().fit(X_train, y_train_clip)
 
     # Treino vs validacao: se o treino for muito melhor, ha overfitting (variancia alta)
     metrics_calc(y_train_orig, model.predict(X_train), "Treino")
     metrics_calc(y_val, model.predict(X_val), "Validacao")
+
+    #Normalizar os dados
+    X_train_norm, X_val_norm, mu, sd = normalizar(X_train, X_val)
+
+    # Testar varios alphas para o Ridge
+    alphas = [0.1, 1, 10]
+    teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val)
 
 
 if __name__ == "__main__":
