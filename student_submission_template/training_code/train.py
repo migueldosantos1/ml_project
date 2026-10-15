@@ -12,7 +12,8 @@ P = 3
 Q = 7
 
 # Corte cronologico: treino antes desta data, validacao a partir dela (nunca aleatorio)
-SPLIT_DATE = "2022-01-01"
+SPLIT_DATE_VAL = "2020-01-01"
+SPLIT_DATE_TEST = "2022-01-01"
 
 # Limiar do clipping: percentil 99.9 do treino. Escolhido porque apanha os 3 erros de
 # medicao (9.63, 6.93, 6.07) sem tocar nos blooms reais (maximo ~4.8)
@@ -87,20 +88,31 @@ def show_peaks(y_train, dates_train, threshold=4):
     # y_train > threshold e uma mascara booleana: so mostra as linhas True
     print(tabela[y_train > threshold])
 
-def normalizar(X_train, X_val):
+def normalizar(X_train, X_val, X_Test):
     mu = X_train.mean()
     sd = X_train.std()
     sd = sd.replace(0, 1) #Se sd = 0 divisão daria NaN
     X_train_norm = (X_train - mu) / sd
     X_val_norm = (X_val - mu) / sd
-    return X_train_norm, X_val_norm, mu, sd
+    X_test_norm = (X_Test - mu) / sd
+    return X_train_norm, X_val_norm, X_test_norm, mu, sd
 
-def teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val):
+def teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val, X_test_norm, y_test):
     for alpha in alphas:
         model = Ridge(alpha=alpha)
         model.fit(X_train_norm, y_train_clip)                                    
-        m_train = metrics_calc(y_train_orig, model.predict(X_train_norm), f"Treino (alpha={alpha})")   
-        m_val = metrics_calc(y_val, model.predict(X_val_norm), f"Validacao (alpha={alpha})")
+        metrics_calc(y_train_orig, model.predict(X_train_norm), f"Treino (alpha={alpha})")   
+        metrics_calc(y_val, model.predict(X_val_norm), f"Validacao (alpha={alpha})")
+        metrics_calc(y_test, model.predict(X_test_norm), f"Teste (alpha={alpha})")
+
+def PQ_iterations(P, Q, df, SPLIT_DATE_VAL, SPLIT_DATE_TEST, TARGET, CLIP_QUANTILE, exog_cols):
+    for p in P:
+        for q in Q:
+            print("P=", p, "Q=", q)
+            X_PQ = build_features(df, P, Q, exog_cols)
+
+
+
 
 def main():
     df = load_data(DATA_PATH)
@@ -108,7 +120,7 @@ def main():
 
     # O limiar tem de ser aprendido so com o treino, senao a validacao influenciava um parametro.
     # Usa-se a clorofila ORIGINAL (antes de cortar) para o quantil
-    train_days = df["date"] < SPLIT_DATE
+    train_days = df["date"] < SPLIT_DATE_VAL
     limiar = df.loc[train_days, TARGET].quantile(CLIP_QUANTILE)
     print(f"Limiar de clipping (P{CLIP_QUANTILE * 100:g}): {limiar:.4f}")
 
@@ -128,12 +140,15 @@ def main():
     y_clip = df_clip.loc[valid, TARGET]
     y_orig = df.loc[valid, TARGET]
 
-    # ~train_mask inverte a mascara: True passa a False, ou seja, fica a validacao
-    train_mask = dates < SPLIT_DATE
-    X_train, X_val = X[train_mask], X[~train_mask]
+    # Separação treino/validacao/teste
+    train_mask = dates < SPLIT_DATE_VAL
+    val_mask = (dates >= SPLIT_DATE_VAL) & (dates < SPLIT_DATE_TEST)
+    test_mask = dates >= SPLIT_DATE_TEST
+    X_train, X_val, X_test = X[train_mask], X[val_mask], X[test_mask]
     y_train_clip = y_clip[train_mask]
     y_train_orig = y_orig[train_mask]
-    y_val = y_orig[~train_mask]
+    y_val = y_orig[val_mask]
+    y_test = y_orig[test_mask]
     print(X_train.shape, X_val.shape)
 
     if SHOW_BASELINE:
@@ -150,16 +165,32 @@ def main():
     model = LinearRegression().fit(X_train, y_train_clip)
 
     # Treino vs validacao: se o treino for muito melhor, ha overfitting (variancia alta)
+    print("LEAST SQUARES")
     metrics_calc(y_train_orig, model.predict(X_train), "Treino")
     metrics_calc(y_val, model.predict(X_val), "Validacao")
+    metrics_calc(y_test, model.predict(X_test), "Teste")
 
     #Normalizar os dados
-    X_train_norm, X_val_norm, mu, sd = normalizar(X_train, X_val)
+    X_train_norm, X_val_norm, X_test_norm, mu, sd = normalizar(X_train, X_val, X_test)
 
     # Testar varios alphas para o Ridge
     alphas = [0.1, 1, 10]
-    teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val)
+    print("RIDGE")
+    teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val, X_test_norm, y_test)
 
+    # Conclui-se assim que o LS e o Ridge com alphas pequenos são equivalentes => LS ganha por ser menos complexo
+
+    # Vamos agora iterar o P e Q
+    P_range = {1, 3, 5, 7, 9}
+    Q_range = {1, 3, 5, 7, 9}
+    #PQ_iterations(P_range, Q_range, df, SPLIT_DATE_VAL, SPLIT_DATE_TEST, TARGET, CLIP_QUANTILE, exog_cols)
+            
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+    ## Testar os modelos em splits diferentes
