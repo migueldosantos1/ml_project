@@ -6,38 +6,32 @@ from sklearn.linear_model import LinearRegression, Ridge
 DATA_PATH = "data/chlorophyll_student_2015_2023.xlsx"
 TARGET = "chlorophyll_a_mg_m3"
 
-# P = nº de lags da clorofila (1..P), Q = nº de lags das v. exogenas (0..Q)
-# Sao hiperparametros: a escolha final vem do erro de validacao (grid search mais tarde)
-P = 3
-Q = 7
-
-# Corte cronologico: treino antes desta data, validacao a partir dela (nunca aleatorio)
+# Tres blocos cronologicos: treino (antes de VAL), validacao (escolher hiperparametros),
+# teste interno (so se olha no fim, uma vez, para a configuracao escolhida)
 SPLIT_DATE_VAL = "2020-01-01"
 SPLIT_DATE_TEST = "2022-01-01"
 
-# Limiar do clipping: percentil 99.9 do treino. Escolhido porque apanha os 3 erros de
-# medicao (9.63, 6.93, 6.07) sem tocar nos blooms reais (maximo ~4.8)
+# Limiar do clipping: percentil 99.9 do treino
 CLIP_QUANTILE = 0.999
 
-# Flags de diagnostico, so ligar quando for preciso ver
+# Listas (nao conjuntos): a ordem fica garantida e e mais facil de ler na tabela final
+P_RANGE = [1, 3, 5, 7, 9]
+Q_RANGE = [0, 1, 3, 5, 7, 9]
+ALPHAS = [0.1, 1, 10, 100]
+
 SHOW_BASELINE = False
-SHOW_QUANTILES = False
-SHOW_PEAKS = False
 
 
 def load_data(path):
     df = pd.read_excel(path, sheet_name="daily_data")
-    df["date"] = pd.to_datetime(df["date"])  # strings -> datetime do pandas
+    df["date"] = pd.to_datetime(df["date"])
     # Ordem cronologica obrigatoria: o shift(k) assume que cada linha e o dia a seguir a anterior
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
 
 def build_features(df, P, Q, exog_cols):
-    # Copia para nao alterar o df original (o predict tambem nao pode mexer no historico)
     copy_df = df.copy()
-    # Dicionario {nome da coluna: coluna}. Se fizesse feats = ... dentro do ciclo, so
-    # ficava com o ultimo lag, porque a variavel era sobrescrita a cada volta
     feats = {}
 
     # Lags da clorofila comecam em 1: o lag 0 seria o valor que queremos prever
@@ -49,13 +43,11 @@ def build_features(df, P, Q, exog_cols):
         for j in range(0, Q + 1):
             feats[f"{col}_lag_{j}"] = copy_df[col].shift(j)
 
-    # Sazonalidade: o ano e um circulo, por isso o dia do ano vai para (sin, cos).
-    # Assim 31 dez e 1 jan ficam proximos. Sao precisos os dois para cada dia ter um par unico
+    # Sazonalidade: o ano e um circulo, por isso o dia do ano vai para (sin, cos)
     doy = copy_df["date"].dt.dayofyear
     feats["s_year"] = np.sin(2 * np.pi * doy / 365.25)
     feats["c_year"] = np.cos(2 * np.pi * doy / 365.25)
 
-    # Ordem das colunas = ordem de insercao no dicionario. Tem de ser igual no predict
     return pd.DataFrame(feats, index=copy_df.index)
 
 
@@ -66,131 +58,122 @@ def clip_target(df, upper):
     return df_clip
 
 
-def metrics_calc(y_true, y_pred, label=""):
+def metrics_calc(y_true, y_pred, label="", verbose=True):
     # Ordem dos argumentos e sempre (verdadeiro, previsto)
     r2 = metrics.r2_score(y_true, y_pred)
     mse = metrics.mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)  # RMSE em mg/m3, que e a metrica pedida no enunciado
+    rmse = np.sqrt(mse)
     mae = metrics.mean_absolute_error(y_true, y_pred)
-    print(f">>> {label} R2 - {r2:.4f}, MSE - {mse:.4f}, RMSE - {rmse:.4f}, MAE - {mae:.4f}")
+    if verbose:
+        print(f">>> {label} R2 - {r2:.4f}, MSE - {mse:.4f}, RMSE - {rmse:.4f}, MAE - {mae:.4f}")
     return {"r2": r2, "mse": mse, "rmse": rmse, "mae": mae}
 
 
-def show_peaks(y_train, dates_train, threshold=4):
-    # Para cada pico mostra o dia anterior e o seguinte.
-    # Vizinhos normais e pico de 1 dia -> erro de medicao. Vizinhos tambem altos -> bloom real
-    tabela = pd.DataFrame({
-        "data": dates_train,
-        "anterior": y_train.shift(1),
-        "pico": y_train,
-        "posterior": y_train.shift(-1),
-    })
-    # y_train > threshold e uma mascara booleana: so mostra as linhas True
-    print(tabela[y_train > threshold])
+def make_splits(df, df_clip, p, q, exog_cols):
+    # Tudo o que depende de (p, q) fica aqui dentro: as features, as linhas validas e os targets.
+    # O numero de linhas validas muda com p e q (lags maiores => mais linhas iniciais com NaN),
+    # por isso valid, y_clip e y_orig tem de ser recalculados para cada combinacao
+    X = build_features(df_clip, p, q, exog_cols)
+    valid = X.notna().all(axis=1)
+    X = X[valid]
+    dates = df.loc[valid, "date"]
 
-def normalizar(X_train, X_val, X_Test):
+    # Dois targets: o cortado serve para treinar, o original serve para avaliar
+    y_clip = df_clip.loc[valid, TARGET]
+    y_orig = df.loc[valid, TARGET]
+
+    train_mask = dates < SPLIT_DATE_VAL
+    val_mask = (dates >= SPLIT_DATE_VAL) & (dates < SPLIT_DATE_TEST)
+    test_mask = dates >= SPLIT_DATE_TEST
+
+    return {
+        "X_train": X[train_mask], "X_val": X[val_mask], "X_test": X[test_mask],
+        "y_train_clip": y_clip[train_mask], "y_train_orig": y_orig[train_mask],
+        "y_val": y_orig[val_mask], "y_test": y_orig[test_mask],
+    }
+
+
+def normalizar(X_train, X_val, X_test):
+    # mu e sd saem SO do treino e aplicam-se aos tres conjuntos
     mu = X_train.mean()
     sd = X_train.std()
-    sd = sd.replace(0, 1) #Se sd = 0 divisão daria NaN
-    X_train_norm = (X_train - mu) / sd
-    X_val_norm = (X_val - mu) / sd
-    X_test_norm = (X_Test - mu) / sd
-    return X_train_norm, X_val_norm, X_test_norm, mu, sd
-
-def teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val, X_test_norm, y_test):
-    for alpha in alphas:
-        model = Ridge(alpha=alpha)
-        model.fit(X_train_norm, y_train_clip)                                    
-        metrics_calc(y_train_orig, model.predict(X_train_norm), f"Treino (alpha={alpha})")   
-        metrics_calc(y_val, model.predict(X_val_norm), f"Validacao (alpha={alpha})")
-        metrics_calc(y_test, model.predict(X_test_norm), f"Teste (alpha={alpha})")
-
-def PQ_iterations(P, Q, df, SPLIT_DATE_VAL, SPLIT_DATE_TEST, TARGET, CLIP_QUANTILE, exog_cols):
-    for p in P:
-        for q in Q:
-            print("P=", p, "Q=", q)
-            X_PQ = build_features(df, P, Q, exog_cols)
+    sd = sd.replace(0, 1)  # coluna constante: dividir por 0 daria NaN
+    return (X_train - mu) / sd, (X_val - mu) / sd, (X_test - mu) / sd, mu, sd
 
 
+def avaliar_modelos(s, alphas):
+    # Treina OLS e Ridge (varios alpha) sobre os mesmos dados normalizados.
+    # O OLS e invariante a escala, por isso normalizar nao o altera.
+    # Devolve uma linha por modelo, com treino e validacao (o teste nao entra aqui)
+    X_tr, X_va, X_te, mu, sd = normalizar(s["X_train"], s["X_val"], s["X_test"])
+
+    modelos = [("OLS", None, LinearRegression())]
+    for a in alphas:
+        modelos.append(("Ridge", a, Ridge(alpha=a)))
+
+    linhas = []
+    for nome, alpha, model in modelos:
+        model.fit(X_tr, s["y_train_clip"])
+        m_train = metrics_calc(s["y_train_orig"], model.predict(X_tr), verbose=False)
+        m_val = metrics_calc(s["y_val"], model.predict(X_va), verbose=False)
+        linhas.append({"metodo": nome, "alpha": alpha,
+                       "rmse_train": m_train["rmse"],
+                       "rmse_val": m_val["rmse"], "r2_val": m_val["r2"]})
+    return linhas
+
+
+def grid_PQ(df, df_clip, exog_cols):
+    resultados = []
+    for p in P_RANGE:
+        for q in Q_RANGE:
+            s = make_splits(df, df_clip, p, q, exog_cols)
+            for linha in avaliar_modelos(s, ALPHAS):
+                linha["P"] = p
+                linha["Q"] = q
+                resultados.append(linha)
+    return pd.DataFrame(resultados)
 
 
 def main():
     df = load_data(DATA_PATH)
     exog_cols = list(df.columns[2:])  # coluna 0 = date, coluna 1 = clorofila, o resto sao as 12 exogenas
 
-    # O limiar tem de ser aprendido so com o treino, senao a validacao influenciava um parametro.
-    # Usa-se a clorofila ORIGINAL (antes de cortar) para o quantil
+    # Limiar aprendido so com o treino, usando a clorofila ORIGINAL
     train_days = df["date"] < SPLIT_DATE_VAL
     limiar = df.loc[train_days, TARGET].quantile(CLIP_QUANTILE)
     print(f"Limiar de clipping (P{CLIP_QUANTILE * 100:g}): {limiar:.4f}")
 
-    # Cortamos o df ANTES de criar os lags, para os lags da clorofila ja herdarem o valor cortado
-    # (um pico aparece como target em t, mas tambem como lag 1, 2 e 3 nos dias seguintes)
+    # Cortamos o df ANTES de criar os lags, para os lags ja herdarem o valor cortado
     df_clip = clip_target(df, limiar)
-    X = build_features(df_clip, P, Q, exog_cols)
-
-    # Linhas com NaN sao as primeiras (lags ainda sem historico). A regressao nao aceita NaN.
-    # .all(axis=1) pergunta, linha a linha, se todas as features sao validas
-    valid = X.notna().all(axis=1)
-    X = X[valid]
-    dates = df.loc[valid, "date"]  # mesma mascara em X, y e dates para ficarem sempre alinhados
-
-    # Dois targets: o cortado serve para treinar (nao deformar os coeficientes),
-    # o original serve para avaliar (2024 tambem vai ter outliers, por isso nao se limpa a validacao)
-    y_clip = df_clip.loc[valid, TARGET]
-    y_orig = df.loc[valid, TARGET]
-
-    # Separação treino/validacao/teste
-    train_mask = dates < SPLIT_DATE_VAL
-    val_mask = (dates >= SPLIT_DATE_VAL) & (dates < SPLIT_DATE_TEST)
-    test_mask = dates >= SPLIT_DATE_TEST
-    X_train, X_val, X_test = X[train_mask], X[val_mask], X[test_mask]
-    y_train_clip = y_clip[train_mask]
-    y_train_orig = y_orig[train_mask]
-    y_val = y_orig[val_mask]
-    y_test = y_orig[test_mask]
-    print(X_train.shape, X_val.shape)
 
     if SHOW_BASELINE:
-        # Persistencia: prever y(t) = y(t-1). Nao tem parametros, e so uma regra fixa de referencia
-        metrics_calc(y_val, X_val["chl_lag_1"], "Persistencia (val)")
-    if SHOW_QUANTILES:
-        print(y_train_orig.quantile([0.95, 0.99, 0.999]))
-        print("Maximo:", y_train_orig.max())
-    if SHOW_PEAKS:
-        show_peaks(y_train_orig, dates[train_mask])
+        s = make_splits(df, df_clip, 3, 7, exog_cols)
+        metrics_calc(s["y_val"], s["X_val"]["chl_lag_1"], "Persistencia (val)")
 
-    # fit estima os pesos (theta) e o intercepto minimizando a soma dos erros ao quadrado.
-    # Nao se adiciona coluna de uns: o LinearRegression ja estima o intercepto
-    model = LinearRegression().fit(X_train, y_train_clip)
+    # Grid: cada linha da tabela e um (P, Q, metodo, alpha). Escolhe-se pelo erro de VALIDACAO
+    tabela = grid_PQ(df, df_clip, exog_cols)
+    tabela = tabela.sort_values("rmse_val").reset_index(drop=True)
+    print(tabela.head(15).to_string())
 
-    # Treino vs validacao: se o treino for muito melhor, ha overfitting (variancia alta)
-    print("LEAST SQUARES")
-    metrics_calc(y_train_orig, model.predict(X_train), "Treino")
-    metrics_calc(y_val, model.predict(X_val), "Validacao")
-    metrics_calc(y_test, model.predict(X_test), "Teste")
+    # Melhor OLS e melhor Ridge, para a tabela do relatorio
+    print("\nMelhor OLS:")
+    print(tabela[tabela["metodo"] == "OLS"].head(1).to_string())
+    print("Melhor Ridge:")
+    print(tabela[tabela["metodo"] == "Ridge"].head(1).to_string())
 
-    #Normalizar os dados
-    X_train_norm, X_val_norm, X_test_norm, mu, sd = normalizar(X_train, X_val, X_test)
+    # O teste interno so se olha agora, uma vez, para a configuracao vencedora
+    best = tabela.iloc[0]
+    s = make_splits(df, df_clip, int(best["P"]), int(best["Q"]), exog_cols)
+    X_tr, X_va, X_te, mu, sd = normalizar(s["X_train"], s["X_val"], s["X_test"])
+    if best["metodo"] == "OLS":
+        model = LinearRegression()
+    else:
+        model = Ridge(alpha=best["alpha"])
+    model.fit(X_tr, s["y_train_clip"])
+    print(f"\nConfiguracao escolhida: {best['metodo']} P={int(best['P'])} Q={int(best['Q'])} alpha={best['alpha']}")
+    metrics_calc(s["y_val"], model.predict(X_va), "Validacao")
+    metrics_calc(s["y_test"], model.predict(X_te), "Teste interno")
 
-    # Testar varios alphas para o Ridge
-    alphas = [0.1, 1, 10]
-    print("RIDGE")
-    teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val, X_test_norm, y_test)
-
-    # Conclui-se assim que o LS e o Ridge com alphas pequenos são equivalentes => LS ganha por ser menos complexo
-
-    # Vamos agora iterar o P e Q
-    P_range = {1, 3, 5, 7, 9}
-    Q_range = {1, 3, 5, 7, 9}
-    #PQ_iterations(P_range, Q_range, df, SPLIT_DATE_VAL, SPLIT_DATE_TEST, TARGET, CLIP_QUANTILE, exog_cols)
-            
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-    ## Testar os modelos em splits diferentes
