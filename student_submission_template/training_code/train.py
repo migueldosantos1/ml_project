@@ -1,9 +1,9 @@
 import numpy as np
 import pandas as pd
 import sklearn.metrics as metrics
-from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
 
-DATA_PATH = "ml_project/data/chlorophyll_student_2015_2023.xlsx"
+DATA_PATH = "data/chlorophyll_student_2015_2023.xlsx"
 TARGET = "chlorophyll_a_mg_m3"
 
 # Corte cronologico: treino antes desta data, validacao a partir dela (nunca aleatorio)
@@ -17,12 +17,13 @@ CLIP_QUANTILE = 0.999
 # Flags de diagnostico, so ligar quando for preciso ver
 SHOW_BASELINE = False
 SHOW_QUANTILES = False
-SHOW_PEAKS = False
+SHOW_PEAKS = True
 
 # Ranges para iteracao dos modelos
 P_RANGE = [1, 3, 5, 7, 9]
 Q_RANGE = [0, 1, 3, 5, 7, 9]
-ALPHAS = [0.1, 1, 10, 100, 1000, 10000]
+ALPHAS_RIDGE = [0.1, 1, 10, 100, 1000, 10000]
+ALPHAS_LASSO = [0.0001, 0.001, 0.01, 0.1]
 
 # Nome dos ficheiros para gravar a grid de iteração dos P, Q e alphas do ridge
 GRID_CSV = "grid_resultados.csv"
@@ -163,17 +164,21 @@ def splits(df_dev, df_dev_clip, p, q, exog_cols):
 def criar_modelo(metodo, alpha):
     if metodo == "LS":
         return LinearRegression()
-    return Ridge(alpha=alpha)
+    if metodo == "Ridge":
+        return Ridge(alpha=alpha)
+    if metodo == "Lasso":
+        return Lasso(alpha=alpha, max_iter=10000)
+    raise ValueError(f"Invalid method: {metodo}")
 
 
-def avaliar_modelos(split, alphas):
+def avaliar_modelos(split, alphas_ridge, alphas_lasso):
     # AINDA PODE SER ATUALIZADA COM MAIS MÉTODOS
-    # Até agora o que faz é avaliar o método de Least Squares e o de Ridge
+    # Até agora o que faz é avaliar o método Least Squares, Ridge e Lasso
     mu, sd = metricas_normalizar(split["X_train"])
     X_tr = (split["X_train"] - mu) / sd
     X_val = (split["X_val"] - mu) / sd
 
-    configs = [("LS", None)] + [("Ridge", a) for a in alphas]
+    configs = ([("LS", None)] + [("Ridge", a) for a in alphas_ridge] + [("Lasso", a) for a in alphas_lasso])
 
     linhas = []
 
@@ -192,7 +197,7 @@ def grid_PQ(df_dev, df_dev_clip, exog_cols):
     for p in P_RANGE:
         for q in Q_RANGE:
             split = splits(df_dev, df_dev_clip, p, q, exog_cols)
-            avaliacao = avaliar_modelos(split, ALPHAS)
+            avaliacao = avaliar_modelos(split, ALPHAS_RIDGE, ALPHAS_LASSO)
             for linha in avaliacao:
                 linha["P"] = p
                 linha["Q"] = q #adiciona os indices de p e q à database
@@ -238,6 +243,8 @@ def main():
     print(tabela[tabela["metodo"] == "LS"].head(1).to_string())
     print("\nMelhor Ridge:")
     print(tabela[tabela["metodo"] == "Ridge"].head(1).to_string())
+    print("\nMelhor Lasso:")
+    print(tabela[tabela["metodo"] == "Lasso"].head(1).to_string())
 
     # Dá print ao melhor modelo com o melhor rmse
     best = tabela.iloc[0] # A melhor linha está na posicao 0
