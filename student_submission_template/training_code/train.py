@@ -3,7 +3,7 @@ import pandas as pd
 import sklearn.metrics as metrics
 from sklearn.linear_model import LinearRegression, Ridge
 
-DATA_PATH = "data/chlorophyll_student_2015_2023.xlsx"
+DATA_PATH = "ml_project/data/chlorophyll_student_2015_2023.xlsx"
 TARGET = "chlorophyll_a_mg_m3"
 
 # Corte cronologico: treino antes desta data, validacao a partir dela (nunca aleatorio)
@@ -22,7 +22,7 @@ SHOW_PEAKS = False
 # Ranges para iteracao dos modelos
 P_RANGE = [1, 3, 5, 7, 9]
 Q_RANGE = [0, 1, 3, 5, 7, 9]
-ALPHAS = [0.1, 1, 10, 100]
+ALPHAS = [0.1, 1, 10, 100, 1000, 10000]
 
 # Nome dos ficheiros para gravar a grid de iteração dos P, Q e alphas do ridge
 GRID_CSV = "grid_resultados.csv"
@@ -101,7 +101,6 @@ def make_splits(df_dev, df_dev_clip, p, q, exog_cols):
     }
 
 
-
 def show_peaks(y_train, dates_train, threshold=4):
     # Para cada pico mostra o dia anterior e o seguinte.
     # Vizinhos normais e pico de 1 dia -> erro de medicao. Vizinhos tambem altos -> bloom real
@@ -114,6 +113,7 @@ def show_peaks(y_train, dates_train, threshold=4):
     # y_train > threshold e uma mascara booleana: so mostra as linhas True
     print(tabela[y_train > threshold])
 
+
 def least_squares(X_train, y_train_clip, y_train_orig, X_val, y_val, X_test, y_test):
     model = LinearRegression().fit(X_train, y_train_clip)
     print("LEAST SQUARES")
@@ -121,11 +121,13 @@ def least_squares(X_train, y_train_clip, y_train_orig, X_val, y_val, X_test, y_t
     metrics_calc(y_val, model.predict(X_val), "Validacao")
     metrics_calc(y_test, model.predict(X_test), "Teste")
 
-def metricas_normalizar(X_train,):
+
+def metricas_normalizar(X_train):
     mu = X_train.mean()
     sd = X_train.std()
     sd = sd.replace(0, 1) #Se sd = 0 divisão daria NaN
     return mu, sd
+
 
 def teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val, X_test_norm, y_test):
     print("RIDGE")
@@ -157,31 +159,33 @@ def splits(df_dev, df_dev_clip, p, q, exog_cols):
         "y_val": y_orig[val_mask],
     }
 
+
 def criar_modelo(metodo, alpha):
     if metodo == "LS":
         return LinearRegression()
     return Ridge(alpha=alpha)
+
 
 def avaliar_modelos(split, alphas):
     # AINDA PODE SER ATUALIZADA COM MAIS MÉTODOS
     # Até agora o que faz é avaliar o método de Least Squares e o de Ridge
     mu, sd = metricas_normalizar(split["X_train"])
     X_tr = (split["X_train"] - mu) / sd
-    X_val = (split["X_val"] - mu)/ sd
+    X_val = (split["X_val"] - mu) / sd
 
-    for alpha in alphas:
-        configs = [("LS", None)] + [("Ridge", alpha)]
+    configs = [("LS", None)] + [("Ridge", a) for a in alphas]
 
     linhas = []
 
     for metodo, alpha in configs:
         model = criar_modelo(metodo, alpha)
         model.fit(X_tr, split["y_train_clip"])
-        m_train = metrics_calc(split["y_train_orig"], model.predict(split["X_train"]), verbose = False)
-        m_val = metrics_calc(split["y_val"], model.predict(split["X_val"]), verbose = False)
+        m_train = metrics_calc(split["y_train_orig"], model.predict(X_tr), Print=False)
+        m_val = metrics_calc(split["y_val"], model.predict(X_val), Print=False)
         linhas.append({"metodo": metodo, "alpha": alpha, "rmse_train": m_train["rmse"], 
                        "rmse_val": m_val["rmse"], "r2_val": m_val["r2"]})
     return linhas
+
     
 def grid_PQ(df_dev, df_dev_clip, exog_cols):
     resultados = []
@@ -195,6 +199,22 @@ def grid_PQ(df_dev, df_dev_clip, exog_cols):
                 resultados.append(linha)
     return pd.DataFrame(resultados)
 
+def retreinar(df, p, q, metodo, alpha, cutoff, exog_cols):
+    train_days = df["date"] < cutoff
+    limiar = df.loc[train_days, TARGET].quantile(CLIP_QUANTILE)
+    df_clip = clip_target(df, limiar) # Cria uma nova df com a parte de teste clipped
+ 
+    X = build_features(df_clip, p, q, exog_cols)
+    valid = X.notna().all(axis=1)
+    train_mask = valid & train_days
+ 
+    mu, sd = metricas_normalizar(X[train_mask])
+    model = criar_modelo(metodo, alpha)
+    model.fit((X[train_mask] - mu) / sd, df_clip.loc[train_mask, TARGET])
+    return {"model": model, "mu": mu, "sd": sd, "limiar": limiar, "X": X, "valid": valid}
+
+
+
 def main():
     df = load_data(DATA_PATH)
     exog_cols = list(df.columns[2:])  # coluna 0 = date, coluna 1 = clorofila, o resto sao as 12 exogenas
@@ -203,7 +223,7 @@ def main():
     df_dev = df[df["date"] < SPLIT_DATE_TEST].reset_index(drop=True)  
 
     # Fazer clip aos outliers (do treino )na database, antes de aplicar os lags
-    limiar = df_dev[df_dev["date"] < SPLIT_DATE_VAL, TARGET].quantile(CLIP_QUANTILE)
+    limiar = df_dev.loc[df_dev["date"] < SPLIT_DATE_VAL, TARGET].quantile(CLIP_QUANTILE)
     print(f"Limiar do clipping (P{CLIP_QUANTILE}) = {limiar:.4f} mg/m3")
     df_dev_clip = clip_target(df_dev, limiar)
 
@@ -214,9 +234,9 @@ def main():
 
     # Melhores resultados
     print(tabela.head(10).to_string())
-    print("\nMelhor OLS:")
-    print(tabela[tabela["metodo"] == "OLS"].head(1).to_string())
-    print("Melhor Ridge:")
+    print("\nMelhor LS:")
+    print(tabela[tabela["metodo"] == "LS"].head(1).to_string())
+    print("\nMelhor Ridge:")
     print(tabela[tabela["metodo"] == "Ridge"].head(1).to_string())
 
     # Dá print ao melhor modelo com o melhor rmse
@@ -224,6 +244,16 @@ def main():
     p, q = int(best["P"]), int(best["Q"])
     metodo, alpha = best["metodo"], best["alpha"]
     print(f"\nEscolhido: {metodo} P={p} Q={q} alpha={alpha}")
+
+    treino = retreinar(df, p, q, metodo, alpha, SPLIT_DATE_TEST, exog_cols)
+    test_mask = treino["valid"] & (df["date"] >= SPLIT_DATE_TEST)
+    X_test = (treino["X"][test_mask] - treino["mu"]) / treino["sd"]
+
+    y_test = df.loc[test_mask, TARGET]
+    y_test_pred = treino["model"].predict(X_test)
+
+    metrics_calc(y_test, y_test_pred, label="Metricas do teste: \n\t", Print=True)
+
 
 if __name__ == "__main__":
     main()
