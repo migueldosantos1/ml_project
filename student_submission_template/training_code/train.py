@@ -2,9 +2,12 @@ import numpy as np
 import pandas as pd
 import sklearn.metrics as metrics
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
+import pickle
+from pathlib import Path
 
 DATA_PATH = "data/chlorophyll_student_2015_2023.xlsx"
 TARGET = "chlorophyll_a_mg_m3"
+MODEL_PATH = Path(__file__).resolve().parent.parent / "best_model" / "model.pkl"
 
 # Corte cronologico: treino antes desta data, validacao a partir dela (nunca aleatorio)
 SPLIT_DATE_VAL = "2020-01-01"
@@ -13,10 +16,6 @@ SPLIT_DATE_TEST = "2022-01-01"
 # Limiar do clipping: percentil 99.9 do treino. Escolhido porque apanha os 3 erros de
 # medicao (9.63, 6.93, 6.07) sem tocar nos blooms reais (maximo ~4.8)
 CLIP_QUANTILE = 0.999
-
-# Flags de diagnostico, so ligar quando for preciso ver
-SHOW_BASELINE = False
-SHOW_QUANTILES = False
 
 # Ranges para iteracao dos modelos
 P_RANGE = [1, 3, 5, 7, 9]
@@ -118,7 +117,6 @@ def criar_modelo(metodo, alpha):
 
 
 def avaliar_modelos(split, alphas_ridge, alphas_lasso):
-    # AINDA PODE SER ATUALIZADA COM MAIS MÉTODOS
     # Até agora o que faz é avaliar o método Least Squares, Ridge e Lasso
     mu, sd = metricas_normalizar(split["X_train"])
     X_tr = (split["X_train"] - mu) / sd
@@ -164,6 +162,10 @@ def retreinar(df, p, q, metodo, alpha, cutoff, exog_cols):
     model.fit((X[train_mask] - mu) / sd, df_clip.loc[train_mask, TARGET])
     return {"model": model, "mu": mu, "sd": sd, "limiar": limiar, "X": X, "valid": valid}
 
+def guardar_modelo(estado, caminho):
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    with open(caminho, "wb") as f:
+        pickle.dump(estado, f)
 
 
 def main():
@@ -206,6 +208,29 @@ def main():
     y_test_pred = treino["model"].predict(X_test)
 
     metrics_calc(y_test, y_test_pred, label="Metricas do teste: \n\t", Print=True)
+
+    #MODELO COM TODOS OS DADOS DO DATA SET
+    cutoff_final = df["date"].max() + pd.Timedelta(days=1)
+    treino_final = retreinar(df, p, q, metodo, alpha, cutoff_final, exog_cols)
+    cols = list(treino_final["X"].columns)
+    mu = treino_final["mu"][cols].to_numpy()
+    sd = treino_final["sd"][cols].to_numpy()
+    limiar = float(treino_final["limiar"])
+    modelo = treino_final["model"]
+
+    #Nome das variáveis que são importadas pelo pickle
+    estado = {
+    "model": modelo, #Lasso
+    "mu": mu, # um array com as médias de todas as colunas de X
+    "sd": sd, # um array com as standart deviations de todas as colunas de X
+    "limiar": limiar, # Valor definido para o clipping
+    "P": p, # delay da clorofila
+    "Q": q, # delay de todas as variáveis exogenas
+    "feature_cols": cols, # a lista de colunas de X
+    "exog_cols": exog_cols, # a lista de colunas extra da database (~data e clorofila)
+    }
+
+    guardar_modelo(estado, MODEL_PATH)
 
 
 if __name__ == "__main__":
