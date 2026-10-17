@@ -17,7 +17,6 @@ CLIP_QUANTILE = 0.999
 # Flags de diagnostico, so ligar quando for preciso ver
 SHOW_BASELINE = False
 SHOW_QUANTILES = False
-SHOW_PEAKS = True
 
 # Ranges para iteracao dos modelos
 P_RANGE = [1, 3, 5, 7, 9]
@@ -80,64 +79,11 @@ def metrics_calc(y_true, y_pred, label="", Print=True):
         print(f">>> {label} R2 - {r2:.4f}, MSE - {mse:.4f}, RMSE - {rmse:.4f}, MAE - {mae:.4f}")
     return {"r2": r2, "mse": mse, "rmse": rmse, "mae": mae}
 
-
-def make_splits(df_dev, df_dev_clip, p, q, exog_cols):
-    # Recebe so o conjunto de DESENVOLVIMENTO (treino + validacao). Os dias de teste nao
-    # existem aqui dentro, por isso e impossivel que influenciem a escolha.
-    # valid, y_clip e y_orig dependem de (p, q), logo recalculam-se a cada combinacao
-    X = build_features(df_dev_clip, p, q, exog_cols)
-    valid = X.notna().all(axis=1)
-    X = X[valid]
-    dates = df_dev.loc[valid, "date"]
- 
-    y_clip = df_dev_clip.loc[valid, TARGET]   # serve para treinar
-    y_orig = df_dev.loc[valid, TARGET]        # serve para avaliar
- 
-    train_mask = dates < SPLIT_DATE_VAL
-    val_mask = ~train_mask
-    return {
-        "X_train": X[train_mask], "X_val": X[val_mask],
-        "y_train_clip": y_clip[train_mask], "y_train_orig": y_orig[train_mask],
-        "y_val": y_orig[val_mask],
-    }
-
-
-def show_peaks(y_train, dates_train, threshold=4):
-    # Para cada pico mostra o dia anterior e o seguinte.
-    # Vizinhos normais e pico de 1 dia -> erro de medicao. Vizinhos tambem altos -> bloom real
-    tabela = pd.DataFrame({
-        "data": dates_train,
-        "anterior": y_train.shift(1),
-        "pico": y_train,
-        "posterior": y_train.shift(-1),
-    })
-    # y_train > threshold e uma mascara booleana: so mostra as linhas True
-    print(tabela[y_train > threshold])
-
-
-def least_squares(X_train, y_train_clip, y_train_orig, X_val, y_val, X_test, y_test):
-    model = LinearRegression().fit(X_train, y_train_clip)
-    print("LEAST SQUARES")
-    metrics_calc(y_train_orig, model.predict(X_train), "Treino")
-    metrics_calc(y_val, model.predict(X_val), "Validacao")
-    metrics_calc(y_test, model.predict(X_test), "Teste")
-
-
 def metricas_normalizar(X_train):
     mu = X_train.mean()
     sd = X_train.std()
     sd = sd.replace(0, 1) #Se sd = 0 divisão daria NaN
     return mu, sd
-
-
-def teste_ridge(alphas, X_train_norm, y_train_clip, y_train_orig, X_val_norm, y_val, X_test_norm, y_test):
-    print("RIDGE")
-    for alpha in alphas:
-        model = Ridge(alpha=alpha)
-        model.fit(X_train_norm, y_train_clip)                                    
-        metrics_calc(y_train_orig, model.predict(X_train_norm), f"Treino (alpha={alpha})")   
-        metrics_calc(y_val, model.predict(X_val_norm), f"Validacao (alpha={alpha})")
-        metrics_calc(y_test, model.predict(X_test_norm), f"Teste (alpha={alpha})")
 
 
 def splits(df_dev, df_dev_clip, p, q, exog_cols):
