@@ -1,10 +1,2 @@
-"""Auxiliary prediction functions imported by my_model.py."""
-
-from __future__ import annotations
-
-from typing import Any
-
-
-def constant_prediction(model: Any) -> float:
-    """Extract the dummy model's constant prediction."""
-    return float(model["constant_prediction"])
+"""Alias: o README e o validador pedem utils.py, o enunciado pede aux.py. O codigo esta em aux.py."""
+from aux import build_features, preparar_features, TARGET

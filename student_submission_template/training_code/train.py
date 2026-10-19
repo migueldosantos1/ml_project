@@ -4,28 +4,25 @@ import sklearn.metrics as metrics
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 import pickle
 from pathlib import Path
+import argparse
 
-DATA_PATH = "data/chlorophyll_student_2015_2023.xlsx"
 TARGET = "chlorophyll_a_mg_m3"
+DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "chlorophyll_student_2015_2023.xlsx"
 MODEL_PATH = Path(__file__).resolve().parent.parent / "best_model" / "model.pkl"
 
-# Corte cronologico: treino antes desta data, validacao a partir dela (nunca aleatorio)
+# Corte cronologico para separação da database em train, validation e test sets
 SPLIT_DATE_VAL = "2020-01-01"
 SPLIT_DATE_TEST = "2022-01-01"
 
-# Limiar do clipping: percentil 99.9 do treino. Escolhido porque apanha os 3 erros de
-# medicao (9.63, 6.93, 6.07) sem tocar nos blooms reais (maximo ~4.8)
+# Limiar do clipping escolhido foi percentil 99.9 do treino. Comparativamente, o percentil 99 ainda apanhava valores considerados
+# realistas (cerca de 3,5), enquanto o P99.9 dá clip a todos os dados acima de 4.3878 mg/m3
 CLIP_QUANTILE = 0.999
 
 # Ranges para iteracao dos modelos
 P_RANGE = [1, 3, 5, 7, 9]
 Q_RANGE = [0, 1, 3, 5, 7, 9]
 ALPHAS_RIDGE = [0.1, 1, 10, 100, 1000, 10000]
-ALPHAS_LASSO = [0.0001, 0.001, 0.01, 0.1]
-
-# Nome dos ficheiros para gravar a grid de iteração dos P, Q e alphas do ridge
-GRID_CSV = "grid_resultados.csv"
-
+ALPHAS_LASSO = [0.0001, 0.001, 0.01, 0.1] # Pelo termo de alpha ser um modulo em vez de um quadrado, alphas realistas são também muito mais pequenos
 
 def load_data(path):
     df = pd.read_excel(path, sheet_name="daily_data")
@@ -36,49 +33,46 @@ def load_data(path):
 
 
 def build_features(df, P, Q, exog_cols):
-    # Copia para nao alterar o df original (o predict tambem nao pode mexer no historico)
-    copy_df = df.copy()
-    # Dicionario {nome da coluna: coluna}. Se fizesse feats = ... dentro do ciclo, so
-    # ficava com o ultimo lag, porque a variavel era sobrescrita a cada volta
+    # Esta função constroi a database com os delays desejados (P, Q)
+    copy_df = df.copy() # Copia para nao alterar o df original
     feats = {}
 
-    # Lags da clorofila comecam em 1: o lag 0 seria o valor que queremos prever
+    # Lags da clorofila comecam em 1
     for i in range(1, P + 1):
         feats[f"chl_lag_{i}"] = copy_df[TARGET].shift(i)
 
-    # Lags das exogenas comecam em 0: a medicao do proprio dia ja esta disponivel
+    # Lags das exogenas comecam em 0 porque a medicao do proprio dia ja esta disponivel
     for col in exog_cols:
         for j in range(0, Q + 1):
             feats[f"{col}_lag_{j}"] = copy_df[col].shift(j)
 
-    # Sazonalidade: o ano e um circulo, por isso o dia do ano vai para (sin, cos).
-    # Assim 31 dez e 1 jan ficam proximos. Sao precisos os dois para cada dia ter um par unico
+    # Necessário para unificar 31 dez e 01 jan
     doy = copy_df["date"].dt.dayofyear
     feats["s_year"] = np.sin(2 * np.pi * doy / 365.25)
     feats["c_year"] = np.cos(2 * np.pi * doy / 365.25)
 
-    # Ordem das colunas = ordem de insercao no dicionario. Tem de ser igual no predict
     return pd.DataFrame(feats, index=copy_df.index)
 
 
 def clip_target(df, upper):
-    # Em vez de apagar linhas (o que desalinhava os lags), limitamos o valor maximo
+    # Clip de acordo com o limiar definido
     df_clip = df.copy()
     df_clip[TARGET] = df_clip[TARGET].clip(upper=upper)
     return df_clip
 
 
 def metrics_calc(y_true, y_pred, label="", Print=True):
-    # Ordem dos argumentos e sempre (verdadeiro, previsto)
+    # Calcula as metricas para analise do modelo e das suas previsões
     r2 = metrics.r2_score(y_true, y_pred)
     mse = metrics.mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)  # RMSE em mg/m3, que e a metrica pedida no enunciado
+    rmse = np.sqrt(mse)  
     mae = metrics.mean_absolute_error(y_true, y_pred)
     if Print:
         print(f">>> {label} R2 - {r2:.4f}, MSE - {mse:.4f}, RMSE - {rmse:.4f}, MAE - {mae:.4f}")
     return {"r2": r2, "mse": mse, "rmse": rmse, "mae": mae}
 
 def metricas_normalizar(X_train):
+    # Retorna a média e standart dev de todas as colunas do dataset
     mu = X_train.mean()
     sd = X_train.std()
     sd = sd.replace(0, 1) #Se sd = 0 divisão daria NaN
@@ -107,6 +101,7 @@ def splits(df_dev, df_dev_clip, p, q, exog_cols):
 
 
 def criar_modelo(metodo, alpha):
+    # Cria o modelo desejado
     if metodo == "LS":
         return LinearRegression()
     if metodo == "Ridge":
@@ -117,7 +112,7 @@ def criar_modelo(metodo, alpha):
 
 
 def avaliar_modelos(split, alphas_ridge, alphas_lasso):
-    # Até agora o que faz é avaliar o método Least Squares, Ridge e Lasso
+    # Avalia o método Least Squares, Ridge e Lasso
     mu, sd = metricas_normalizar(split["X_train"])
     X_tr = (split["X_train"] - mu) / sd
     X_val = (split["X_val"] - mu) / sd
@@ -137,6 +132,7 @@ def avaliar_modelos(split, alphas_ridge, alphas_lasso):
 
     
 def grid_PQ(df_dev, df_dev_clip, exog_cols):
+    # Cria uma database para comparar as várias iterações
     resultados = []
     for p in P_RANGE:
         for q in Q_RANGE:
@@ -149,6 +145,7 @@ def grid_PQ(df_dev, df_dev_clip, exog_cols):
     return pd.DataFrame(resultados)
 
 def retreinar(df, p, q, metodo, alpha, cutoff, exog_cols):
+    # Serve para reaproveitar o validation set antes de testar o model no test set - sem reescrever os hiperparametros
     train_days = df["date"] < cutoff
     limiar = df.loc[train_days, TARGET].quantile(CLIP_QUANTILE)
     df_clip = clip_target(df, limiar) # Cria uma nova df com a parte de teste clipped
@@ -163,27 +160,33 @@ def retreinar(df, p, q, metodo, alpha, cutoff, exog_cols):
     return {"model": model, "mu": mu, "sd": sd, "limiar": limiar, "X": X, "valid": valid}
 
 def guardar_modelo(estado, caminho):
+    # Serve para guardar o pickle
     caminho.parent.mkdir(parents=True, exist_ok=True)
     with open(caminho, "wb") as f:
         pickle.dump(estado, f)
 
 
 def main():
-    df = load_data(DATA_PATH)
+    # Bloco necessário para abrir o xlsx de qualquer pasta
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, default=DATA_PATH)
+    args = parser.parse_args()
+
+    # Criar a database
+    df = load_data(args.data)
     exog_cols = list(df.columns[2:])  # coluna 0 = date, coluna 1 = clorofila, o resto sao as 12 exogenas
 
     # separa-se desde já os dados de teste, de treino e de validacao. O teste so e usado no final, para avaliar o modelo final
     df_dev = df[df["date"] < SPLIT_DATE_TEST].reset_index(drop=True)  
 
-    # Fazer clip aos outliers (do treino )na database, antes de aplicar os lags
+    # Fazer clip aos outliers (do treino) na database, antes de aplicar os lags
     limiar = df_dev.loc[df_dev["date"] < SPLIT_DATE_VAL, TARGET].quantile(CLIP_QUANTILE)
     print(f"Limiar do clipping (P{CLIP_QUANTILE}) = {limiar:.4f} mg/m3")
     df_dev_clip = clip_target(df_dev, limiar)
 
-    # Gerar uma tabela com todos os dados acerca dos modelos 
+    # Gerar uma database com todos os dados acerca dos modelos 
     tabela = grid_PQ(df_dev, df_dev_clip, exog_cols)
     tabela = tabela.sort_values("rmse_val").reset_index(drop=True)
-    tabela.to_csv(GRID_CSV, index=False)
 
     # Melhores resultados
     print(tabela.head(10).to_string())
@@ -200,6 +203,7 @@ def main():
     metodo, alpha = best["metodo"], best["alpha"]
     print(f"\nEscolhido: {metodo} P={p} Q={q} alpha={alpha}")
 
+    # Com os dados adquiridos volta a criar-se o modelo com os dados de treino e validação - sem alterar P, Q, alpha e o método escolhidos
     treino = retreinar(df, p, q, metodo, alpha, SPLIT_DATE_TEST, exog_cols)
     test_mask = treino["valid"] & (df["date"] >= SPLIT_DATE_TEST)
     X_test = (treino["X"][test_mask] - treino["mu"]) / treino["sd"]
@@ -209,7 +213,7 @@ def main():
 
     metrics_calc(y_test, y_test_pred, label="Metricas do teste: \n\t", Print=True)
 
-    #MODELO COM TODOS OS DADOS DO DATA SET
+    # MODELO COM TODOS OS DADOS DO DATA SET -> para ser aplicado no test set final
     cutoff_final = df["date"].max() + pd.Timedelta(days=1)
     treino_final = retreinar(df, p, q, metodo, alpha, cutoff_final, exog_cols)
     cols = list(treino_final["X"].columns)
@@ -227,11 +231,13 @@ def main():
     "P": p, # delay da clorofila
     "Q": q, # delay de todas as variáveis exogenas
     "feature_cols": cols, # a lista de colunas de X
-    "exog_cols": exog_cols, # a lista de colunas extra da database (~data e clorofila)
+    "exog_cols": exog_cols, # 12 variáveis exógenas na database (exceto data e clorofila)
     }
 
+    # Gravar o estado no pkl e verificar
     guardar_modelo(estado, MODEL_PATH)
-
+    (modelo.coef_ != 0).sum()
+    print(f"Modelo guardado em {MODEL_PATH} ({(modelo.coef_ != 0).sum()} features ativas)")
 
 if __name__ == "__main__":
     main()
